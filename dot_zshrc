@@ -104,5 +104,6 @@ fi
 
 
 alias rm="trash"
+alias bat="batcat"
 
 cat ~/.cache/wal/sequences
