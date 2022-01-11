@@ -117,5 +117,5 @@ if ! shopt -oq posix; then
 fi
 
 alias rm=trash
-
+export PATH="$HOME/bin:$PATH"
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/charlie/.mujoco/mujoco200/bin
