@@ -118,4 +118,4 @@ fi
 
 alias rm=trash
 export PATH="$HOME/bin:$PATH"
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/charlie/.mujoco/mujoco200/bin
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/home/$USER/.mujoco/mujoco200/bin
