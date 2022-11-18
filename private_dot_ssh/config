@@ -2,3 +2,17 @@ Host arcade
    HostName arcade.iro.umontreal.ca
    User gautchar
    PreferredAuthentications password
+
+Host blue
+   ProxyJump arcade
+   HostName 172.19.8.33
+   User charlie
+   PreferredAuthentications publickey,password
+   IdentityFile /home/charlie/Templates/my-keys/glen_lab
+
+Host green
+   ProxyJump arcade
+   HostName 172.19.8.32
+   User charlie
+   PreferredAuthentications publickey,password
+   IdentityFile /home/charlie/Templates/my-keys/glen_lab
