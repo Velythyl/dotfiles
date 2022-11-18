@@ -1,0 +1,4 @@
+#!/bin/bash
+current_bg=$(gsettings get org.gnome.desktop.background picture-uri)
+current_bg=${current_bg:8:-1}
+wal -i $current_bg
