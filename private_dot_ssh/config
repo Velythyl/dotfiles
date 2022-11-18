@@ -1,0 +1,4 @@
+Host arcade
+   HostName arcade.iro.umontreal.ca
+   User gautchar
+   PreferredAuthentications password
