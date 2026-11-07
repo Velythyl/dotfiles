@@ -1,0 +1,292 @@
+#!/bin/bash
+# Keep each SketchyBar workspace marker representative of its last-focused app.
+
+set -euo pipefail
+
+aerospace_bin="${AEROSPACE_BIN:-/opt/homebrew/bin/aerospace}"
+sketchybar_bin="${SKETCHYBAR_BIN:-/opt/homebrew/bin/sketchybar}"
+state_dir="${AEROSPACE_ICON_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/aerospace-sketchybar}"
+cache_dir="${AEROSPACE_ICON_CACHE_DIR:-$HOME/Library/Caches/aerospace-sketchybar}"
+visible_state_file="$state_dir/visible-workspaces"
+aerospace_config_dir="${AEROSPACE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/aerospace}"
+renderer_source="$aerospace_config_dir/render-monochrome-app-icon.swift"
+renderer_bin="${AEROSPACE_ICON_RENDERER:-$cache_dir/render-monochrome-app-icon}"
+simple_icons_dir="$aerospace_config_dir/simple-icons"
+simple_icons_map="$aerospace_config_dir/simple-icons.bundle-map"
+victor_mono_map="$aerospace_config_dir/victor-mono.bundle-map"
+
+usage() {
+    echo "Usage: $(basename "$0") [--from-focus|--refresh|--workspace-change <previous> <current>]" >&2
+}
+
+mode="refresh"
+previous_workspace=""
+current_workspace=""
+if (($#)); then
+    case "$1" in
+        --from-focus) mode="from-focus" ;;
+        --refresh) ;;
+        --workspace-change)
+            [[ $# -eq 3 ]] || { usage; exit 2; }
+            mode="workspace-change"
+            previous_workspace="$2"
+            current_workspace="$3"
+            ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage; exit 2 ;;
+    esac
+fi
+
+# Focus and workspace callbacks can overlap. Serialize them so an older process
+# cannot overwrite a newer icon state halfway through an update. The focused
+# and visible workspaces are queried only after the lock is held, so a delayed
+# callback always renders the current AeroSpace state.
+lock_dir="${AEROSPACE_ICON_LOCK_DIR:-${TMPDIR:-/tmp}/aerospace-sync-workspace-icons.lock}"
+lock_acquired=false
+for ((attempt = 0; attempt < 200; attempt++)); do
+    if mkdir "$lock_dir" 2>/dev/null; then
+        printf '%s\n' "$$" > "$lock_dir/pid"
+        lock_acquired=true
+        break
+    fi
+
+    if [[ -f "$lock_dir/pid" ]]; then
+        lock_owner="$(<"$lock_dir/pid")"
+        if [[ "$lock_owner" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_owner" 2>/dev/null; then
+            rm -f "$lock_dir/pid"
+            rmdir "$lock_dir" 2>/dev/null || true
+            continue
+        fi
+    fi
+    sleep 0.05
+done
+
+if [[ "$lock_acquired" == false ]]; then
+    echo "aerospace-sync-workspace-icons: timed out waiting for update lock" >&2
+    exit 1
+fi
+trap 'rm -f "$lock_dir/pid"; rmdir "$lock_dir" 2>/dev/null || true' EXIT
+
+mkdir -p "$state_dir" "$cache_dir"
+
+sanitize_bundle_id() {
+    printf '%s' "$1" | /usr/bin/tr -c '[:alnum:]._-' '_'
+}
+
+state_file_for_workspace() {
+    local workspace_key
+    workspace_key="$(printf '%s' "$1" | /usr/bin/tr -c '[:alnum:]._-' '_')"
+    printf '%s/workspace-%s' "$state_dir" "$workspace_key"
+}
+
+store_last_focused_app() {
+    printf '%s|%s\n' "$2" "$3" > "$(state_file_for_workspace "$1")"
+}
+
+ensure_renderer() {
+    if [[ ! -x "$renderer_bin" || "$renderer_source" -nt "$renderer_bin" ]]; then
+        /usr/bin/swiftc -D CI_SILENCE_GL_DEPRECATION "$renderer_source" -o "$renderer_bin"
+    fi
+}
+
+simple_icon_for_bundle() {
+    local bundle_id="$1" icon_name
+    [[ -f "$simple_icons_map" ]] || return 0
+    icon_name="$(/usr/bin/awk -F '|' -v bundle="$bundle_id" '$1 == bundle { print $2; exit }' "$simple_icons_map")"
+    [[ -n "$icon_name" && -f "$simple_icons_dir/$icon_name.svg" ]] || return 0
+    printf '%s\n' "$simple_icons_dir/$icon_name.svg"
+}
+
+victor_mono_icon_for_bundle() {
+    local bundle_id="$1"
+    [[ -f "$victor_mono_map" ]] || return 0
+    /usr/bin/awk -F '|' -v bundle="$bundle_id" '$1 == bundle { print $2; exit }' "$victor_mono_map"
+}
+
+rasterize_simple_icon() {
+    local svg_path="$1" output_path="$2"
+    if [[ ! -f "$output_path" || "$svg_path" -nt "$output_path" ]]; then
+        /usr/bin/sips -s format png -z 128 128 "$svg_path" --out "$output_path" >/dev/null
+    fi
+}
+
+ensure_cached_icons() {
+    local bundle_id="$1" bundle_path="$2" cache_key active_icon inactive_icon icon_source render_source simple_icon
+    cache_key="$(sanitize_bundle_id "$bundle_id")"
+    icon_source="$bundle_path"
+    render_source="$bundle_path"
+    simple_icon="$(simple_icon_for_bundle "$bundle_id")"
+    if [[ -n "$simple_icon" ]]; then
+        cache_key="simple-icons-$cache_key"
+        icon_source="$simple_icon"
+        render_source="$cache_dir/$cache_key-source.png"
+        rasterize_simple_icon "$simple_icon" "$render_source"
+    fi
+    active_icon="$cache_dir/$cache_key-active.png"
+    inactive_icon="$cache_dir/$cache_key-inactive.png"
+    ensure_renderer
+    if [[ ! -f "$active_icon" || ! -f "$inactive_icon" || "$renderer_source" -nt "$active_icon" || "$icon_source" -nt "$active_icon" || "$render_source" -nt "$active_icon" ]]; then
+        if [[ -n "$simple_icon" ]]; then
+            "$renderer_bin" "$render_source" "$active_icon" "$inactive_icon" --preserve-alpha
+        else
+            "$renderer_bin" "$render_source" "$active_icon" "$inactive_icon"
+        fi
+    fi
+    printf '%s|%s\n' "$active_icon" "$inactive_icon"
+}
+
+set_generic_icon() {
+    "$sketchybar_bin" --set "space.$1" \
+        icon='' icon.drawing=on icon.width=dynamic \
+        icon.background.drawing=off
+}
+
+set_app_icon() {
+    "$sketchybar_bin" --set "space.$1" \
+        icon=' ' icon.drawing=on icon.width=18 \
+        icon.background.drawing=on icon.background.height=18 \
+        icon.background.color=0x00000000 \
+        icon.background.image="$2" \
+        icon.background.image.drawing=on \
+        icon.background.image.scale=0.30
+}
+
+set_font_icon() {
+    "$sketchybar_bin" --set "space.$1" \
+        icon="$2" icon.drawing=on icon.width=dynamic \
+        icon.background.drawing=off icon.background.image.drawing=off
+}
+
+focused_workspace="${AEROSPACE_WORKSPACE:-}"
+
+if [[ "$mode" == "from-focus" ]]; then
+    focused_window="$($aerospace_bin list-windows --focused --format '%{workspace}|%{app-bundle-id}|%{app-bundle-path}' 2>/dev/null || true)"
+    if [[ -n "$focused_window" ]]; then
+        IFS='|' read -r focused_workspace focused_bundle_id focused_bundle_path <<< "$focused_window"
+        if [[ -n "$focused_workspace" && -n "$focused_bundle_id" && -n "$focused_bundle_path" ]]; then
+            store_last_focused_app "$focused_workspace" "$focused_bundle_id" "$focused_bundle_path"
+        fi
+    fi
+fi
+
+if [[ -z "$focused_workspace" ]]; then
+    focused_workspace="$($aerospace_bin list-workspaces --focused --format '%{workspace}' 2>/dev/null || true)"
+fi
+
+visible_workspaces="$($aerospace_bin list-workspaces --monitor all --visible \
+    --format '%{workspace}' 2>/dev/null || true)"
+
+workspace_is_visible() {
+    local wanted_workspace="$1"
+    printf '%s\n' "$visible_workspaces" | /usr/bin/awk -v workspace="$wanted_workspace" \
+        '$0 == workspace { found = 1; exit } END { exit !found }'
+}
+
+workspace_is_in_rows() {
+    local wanted_workspace="$1" rows="$2"
+    printf '%s\n' "$rows" | /usr/bin/awk -v workspace="$wanted_workspace" \
+        '$0 == workspace { found = 1; exit } END { exit !found }'
+}
+
+store_visible_workspaces() {
+    printf '%s\n' "$visible_workspaces" > "$visible_state_file"
+}
+
+notify_workspace_icon_change() {
+    # Workspace highlighting is handled by `aerospace_workspace_change`, but
+    # icon refreshes can also come from focus changes and display-layout
+    # updates. Notify dependent SketchyBar items after the icon mutations have
+    # completed. This helper is also run during startup before the event is
+    # registered, so a failed notification must not fail the sync itself.
+    "$sketchybar_bin" --trigger aerospace_workspace_icons_changed >/dev/null 2>&1 || true
+}
+
+update_workspace_icon() {
+    local workspace="$1" workspace_windows state_file selected_app stored_app stored_bundle_id
+    local bundle_id bundle_path victor_mono_icon active_icon inactive_icon
+    workspace_windows="$($aerospace_bin list-windows --workspace "$workspace" --format '%{app-bundle-id}|%{app-bundle-path}' 2>/dev/null || true)"
+    state_file="$(state_file_for_workspace "$workspace")"
+    if [[ -z "$workspace_windows" ]]; then
+        rm -f "$state_file"
+        set_generic_icon "$workspace"
+        return
+    fi
+
+    selected_app=""
+    if [[ -f "$state_file" ]]; then
+        stored_app="$(<"$state_file")"
+        stored_bundle_id="${stored_app%%|*}"
+        selected_app="$(printf '%s\n' "$workspace_windows" | /usr/bin/awk -F '|' -v bundle="$stored_bundle_id" '$1 == bundle { print; exit }')"
+    fi
+    if [[ -z "$selected_app" ]]; then
+        selected_app="$(printf '%s\n' "$workspace_windows" | /usr/bin/awk 'NF { print; exit }')"
+    fi
+
+    IFS='|' read -r bundle_id bundle_path <<< "$selected_app"
+    if [[ -z "$bundle_id" || -z "$bundle_path" ]]; then
+        set_generic_icon "$workspace"
+        return
+    fi
+
+    store_last_focused_app "$workspace" "$bundle_id" "$bundle_path"
+    victor_mono_icon="$(victor_mono_icon_for_bundle "$bundle_id")"
+    if [[ -n "$victor_mono_icon" ]]; then
+        set_font_icon "$workspace" "$victor_mono_icon"
+        return
+    fi
+
+    IFS='|' read -r active_icon inactive_icon <<< "$(ensure_cached_icons "$bundle_id" "$bundle_path")"
+    if workspace_is_visible "$workspace"; then
+        set_app_icon "$workspace" "$active_icon"
+    else
+        set_app_icon "$workspace" "$inactive_icon"
+    fi
+}
+
+if [[ "$mode" == "from-focus" ]]; then
+    if [[ -n "$focused_workspace" ]]; then
+        update_workspace_icon "$focused_workspace"
+        notify_workspace_icon_change
+    fi
+    exit 0
+fi
+
+if [[ "$mode" == "workspace-change" ]]; then
+    # AEROSPACE_PREV_WORKSPACE is the previously globally focused workspace.
+    # When a click switches a different monitor, it is not necessarily the
+    # workspace that just became hidden there. Compare visible sets so the
+    # actual replaced workspace receives its inactive icon.
+    if [[ -f "$visible_state_file" ]]; then
+        previous_visible_workspaces="$(<"$visible_state_file")"
+        changed_candidates="$(printf '%s\n%s\n' "$previous_visible_workspaces" "$visible_workspaces" | \
+            /usr/bin/awk 'NF && !seen[$0]++')"
+
+        while IFS= read -r workspace; do
+            [[ -n "$workspace" ]] || continue
+            was_visible=false
+            is_visible=false
+            workspace_is_in_rows "$workspace" "$previous_visible_workspaces" && was_visible=true
+            workspace_is_in_rows "$workspace" "$visible_workspaces" && is_visible=true
+            [[ "$was_visible" == "$is_visible" ]] || update_workspace_icon "$workspace"
+        done <<< "$changed_candidates"
+    else
+        # First callback after an upgrade has no visibility snapshot. Refresh
+        # all workspaces once to establish a trustworthy baseline.
+        workspace_rows="$($aerospace_bin list-workspaces --all --format '%{workspace}' 2>/dev/null || true)"
+        while IFS= read -r workspace; do
+            [[ -n "$workspace" ]] || continue
+            update_workspace_icon "$workspace"
+        done <<< "$workspace_rows"
+    fi
+    store_visible_workspaces
+    notify_workspace_icon_change
+    exit 0
+fi
+
+workspace_rows="$($aerospace_bin list-workspaces --all --format '%{workspace}' 2>/dev/null || true)"
+while IFS= read -r workspace; do
+    [[ -n "$workspace" ]] || continue
+    update_workspace_icon "$workspace"
+done <<< "$workspace_rows"
+store_visible_workspaces
+notify_workspace_icon_change

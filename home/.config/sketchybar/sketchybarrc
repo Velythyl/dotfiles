@@ -1,0 +1,371 @@
+#!/usr/bin/env bash
+
+# === CONFIG ROOT ===
+CONFIG_DIR="$HOME/.config/sketchybar"
+PLUGIN_DIR="$CONFIG_DIR/plugins"
+
+# === COLORS ===
+CLR_BG=0x00000000          # Transparent bar background
+CLR_COMP_BG=0xff1d2021     # Compartment background (Gruvbox dark)
+CLR_COMP_BORDER=0xff3c3836 # Compartment border (Gruvbox gray)
+CLR_FG=0xffebdbb2          # Foreground (Gruvbox light text)
+
+# === PADDING CONSTANTS
+BAR_PADDING=8             # Outer bar padding (use compartments for outer spacing)
+ITEM_PADDING=6             # Default horizontal padding between items
+ICON_PADDING=2             # Consistent icon inner padding (reduced from mixed 2/4 for tighter look)
+LABEL_PADDING=2            # Consistent label inner padding (unified from 4/2)
+COMP_PADDING=6             # Compartment outer padding (increased from bar-level 0 for breathing room)
+# The physical notch is 185pt wide.  Give the notch-aware `q`/`e` lanes an
+# extra 8pt on each side so items end just outside the camera housing.
+PHYSICAL_NOTCH_WIDTH=185
+NOTCH_CLEARANCE=8
+NOTCH_LANE_WIDTH=$((PHYSICAL_NOTCH_WIDTH + 2 * NOTCH_CLEARANCE))
+
+# === CPU TEMPERATURE PROVIDER (Apple Silicon) ===
+# Prefer an explicit override, then a local build, then the Homebrew package.
+STATS_PROVIDER_BIN="${STATS_PROVIDER_BIN:-$HOME/.local/bin/stats_provider}"
+if [[ ! -x "$STATS_PROVIDER_BIN" ]]; then
+  STATS_PROVIDER_BIN="$(command -v stats_provider || true)"
+fi
+if [[ -n "$STATS_PROVIDER_BIN" && -x "$STATS_PROVIDER_BIN" ]]; then
+  # Match the helper process itself, not the shell running this config.  A
+  # `pkill -f` pattern containing the helper arguments can match SketchyBar's
+  # reload shell and terminate the config before it recreates its items.
+  pkill -x "$(basename "$STATS_PROVIDER_BIN")" >/dev/null 2>&1
+  "$STATS_PROVIDER_BIN" --cpu temperature &
+fi
+
+# === BAR (No outer padding; defer to compartments) ===
+sketchybar --bar position=top height=34 blur_radius=0 color="$CLR_BG" padding_left="$BAR_PADDING" padding_right="$BAR_PADDING" notch_width="$NOTCH_LANE_WIDTH"
+
+# === DEFAULTS (Unified paddings for all items/icons/labels) ===
+sketchybar --default \
+  padding_left="$ITEM_PADDING" \
+  padding_right="$ITEM_PADDING" \
+  icon.font="VictorMono Nerd Font:Regular:12.0" \
+  label.font="VictorMono Nerd Font:Regular:14.0" \
+  icon.color="$CLR_FG" \
+  label.color="$CLR_FG" \
+  icon.padding_left="$ICON_PADDING" \
+  icon.padding_right="$ICON_PADDING" \
+  label.padding_left="$LABEL_PADDING" \
+  label.padding_right="$LABEL_PADDING"
+
+# === WORKSPACES ===
+sketchybar --add event aerospace_workspace_change
+# Emitted by the icon synchronizer after it finishes changing workspace icons.
+sketchybar --add event aerospace_workspace_icons_changed
+
+# Reapply the AeroSpace workspace map whenever macOS changes display topology.
+# The item is intentionally invisible; it only hosts the event handler.
+sketchybar --add item aerospace_display_layout left \
+  --set aerospace_display_layout drawing=off script="$PLUGIN_DIR/aerospace-display-change.sh" \
+  --subscribe aerospace_display_layout display_change
+
+WORKSPACE_ICONS=("" "" "" "󱙺" "" "" "" "󰎇" "󰖣")
+WORKSPACE_SUBSCRIPTS=("₁" "₂" "₃" "₄" "₅" "₆" "₇" "₈" "₉")
+LEFT_SPACE_ITEMS=()
+INDEX=0
+
+# A config reload does not implicitly delete dynamic items. Rebuild this set
+# from AeroSpace's current inventory so old workspace items cannot retain a
+# click handler that recreates a workspace which no longer exists.
+sketchybar --remove '/space\..*/'
+
+# SketchyBar is launched from AeroSpace's after-startup hook.  The hook can
+# run before AeroSpace's IPC server has published the workspace list, which
+# previously let the bar finish loading with no space.* items.  Wait briefly
+# for at least one row so the workspace section is created on a cold login.
+WORKSPACE_ROWS=""
+for ((attempt = 0; attempt < 150; attempt++)); do
+  WORKSPACE_ROWS="$(aerospace list-workspaces --all --format '%{workspace}|%{monitor-id}' 2>/dev/null)"
+  [[ -n "$WORKSPACE_ROWS" ]] && break
+  sleep 0.1
+done
+
+# Physical displays normally share a CoreGraphics direct ID between AeroSpace
+# and SketchyBar. AirPlay displays do not: AeroSpace can report a synthetic
+# AppKit ID such as 2 while SketchyBar reports a direct ID such as 14. Build a
+# monitor-to-arrangement bridge that reserves physical direct-ID matches first,
+# then assigns unresolved wireless monitors to the remaining arrangements.
+AEROSPACE_MONITOR_ROWS="$(aerospace list-monitors --format '%{monitor-id}|%{monitor-name}|%{monitor-appkit-nsscreen-screens-id}' 2>/dev/null)"
+SKETCHYBAR_DISPLAY_ROWS="$(sketchybar --query displays 2>/dev/null | /usr/bin/awk -F ':' '
+  /"arrangement-id"/ {
+    arrangement = $2
+    gsub(/[^0-9]/, "", arrangement)
+  }
+  /"DirectDisplayID"/ {
+    direct_id = $2
+    gsub(/[^0-9]/, "", direct_id)
+    if (direct_id != "" && arrangement != "") print direct_id "|" arrangement
+  }
+')"
+
+MONITOR_DISPLAY_ROWS="$(
+  {
+    printf '%s\n' "$AEROSPACE_MONITOR_ROWS" | /usr/bin/awk -F '|' '{ print "M|" $1 "|" $3 "|" $2 }'
+    printf '%s\n' "$SKETCHYBAR_DISPLAY_ROWS" | /usr/bin/awk -F '|' '{ print "S|" $1 "|" $2 }'
+  } | /usr/bin/awk -F '|' '
+    $1 == "M" {
+      monitor_count++
+      monitor_id[monitor_count] = $2
+      appkit_id[monitor_count] = $3
+      monitor_name[monitor_count] = tolower($4)
+    }
+    $1 == "S" {
+      sketchybar_count++
+      direct_id[sketchybar_count] = $2
+      arrangement_id[sketchybar_count] = $3
+    }
+    END {
+      for (i = 1; i <= monitor_count; i++) {
+        if (monitor_name[i] ~ /airplay/) continue
+        for (j = 1; j <= sketchybar_count; j++) {
+          if (!used[j] && appkit_id[i] == direct_id[j]) {
+            mapped[i] = arrangement_id[j]
+            used[j] = 1
+            break
+          }
+        }
+      }
+      for (i = 1; i <= monitor_count; i++) {
+        if (mapped[i] != "") continue
+        for (j = 1; j <= sketchybar_count; j++) {
+          if (!used[j] && appkit_id[i] == arrangement_id[j]) {
+            mapped[i] = arrangement_id[j]
+            used[j] = 1
+            break
+          }
+        }
+      }
+      for (i = 1; i <= monitor_count; i++) {
+        if (mapped[i] != "") continue
+        for (j = 1; j <= sketchybar_count; j++) {
+          if (!used[j]) {
+            mapped[i] = arrangement_id[j]
+            used[j] = 1
+            break
+          }
+        }
+      }
+      for (i = 1; i <= monitor_count; i++) {
+        if (mapped[i] != "") print monitor_id[i] "|" mapped[i]
+      }
+    }
+  '
+)"
+
+sketchybar_display_for_monitor_id() {
+  printf '%s\n' "$MONITOR_DISPLAY_ROWS" | /usr/bin/awk -F '|' -v monitor_id="$1" '$1 == monitor_id { print $2; exit }'
+}
+
+while IFS='|' read -r sid display; do
+  icon="${WORKSPACE_ICONS[$INDEX]:-}"
+  subscript="${WORKSPACE_SUBSCRIPTS[$INDEX]:-$sid}"
+  item="space.$sid"
+  sketchybar_display="$(sketchybar_display_for_monitor_id "$display")"
+  # A temporary lack of display inventory at startup is safer as `all` than
+  # treating a CoreGraphics display ID as an arrangement ID.
+  [[ "$sketchybar_display" =~ ^[1-9][0-9]*$ ]] || sketchybar_display=all
+  LEFT_SPACE_ITEMS+=("$item")
+
+  sketchybar --add item "$item" left \
+    --subscribe "$item" aerospace_workspace_change \
+    --set "$item" \
+      background.color=0xff000000 \
+      background.corner_radius=5 \
+      background.height=20 \
+      background.drawing=off \
+      icon="$icon" \
+      label="$subscript" \
+      icon.padding_left="$ICON_PADDING" \
+      icon.padding_right=0 \
+      label.padding_left=0 \
+      label.padding_right="$LABEL_PADDING" \
+      display="$sketchybar_display" \
+      click_script="aerospace workspace $sid" \
+      script="$PLUGIN_DIR/aerospace.sh $sid"
+
+  ((INDEX++))
+done <<< "$WORKSPACE_ROWS"
+
+"$HOME/.local/bin/aerospace-sync-workspace-icons" --refresh &
+
+# === FRONT APP
+sketchybar --add item front_app left \
+  --set front_app \
+    script="$PLUGIN_DIR/front_app.sh" \
+    label.y_offset=1 \
+    label.padding_right="$COMP_PADDING" \
+  --subscribe front_app front_app_switched aerospace_workspace_change
+
+# === RIGHT SIDE ITEMS ===
+sketchybar --add item aerospace_toggle right \
+  --set aerospace_toggle \
+    icon.drawing=off \
+    label=Aero \
+    label.padding_left="$COMP_PADDING" \
+    label.padding_right="$COMP_PADDING" \
+    background.color=0x00000000 \
+    background.border_color="$CLR_FG" \
+    background.border_width=1 \
+    background.corner_radius=0 \
+    background.height=20 \
+    script="$PLUGIN_DIR/aerospace-toggle.sh" \
+    click_script="$PLUGIN_DIR/aerospace-toggle.sh toggle"
+
+# Added after the right-anchored AeroSpace toggle so it appears immediately to
+# its left. The handler detaches because restarting SketchyBar kills its parent.
+sketchybar --add item restart_aerospace_sketchybar right \
+  --set restart_aerospace_sketchybar \
+    icon.drawing=off \
+    label=RST \
+    label.padding_left="$COMP_PADDING" \
+    label.padding_right="$COMP_PADDING" \
+    background.color=0x00000000 \
+    background.border_color="$CLR_FG" \
+    background.border_width=1 \
+    background.corner_radius=0 \
+    background.height=20 \
+    click_script="$PLUGIN_DIR/restart-aerospace-sketchybar.sh"
+
+sketchybar --add item clock right \
+  --set clock update_freq=10 icon= script="$PLUGIN_DIR/clock.sh" label.padding_right="$COMP_PADDING"
+
+sketchybar --add item volume right \
+  --set volume script="$PLUGIN_DIR/volume.sh" \
+  --subscribe volume volume_change
+
+sketchybar --add item battery right \
+  --set battery update_freq=120 script="$PLUGIN_DIR/battery.sh" \
+  --subscribe battery system_woke power_source_change
+
+sketchybar --add item keyboard_layout right \
+  --set keyboard_layout update_freq=1 icon=ABC label.drawing=off script="$PLUGIN_DIR/keyboard_layout.sh"
+
+sketchybar --add item net right \
+  --set net update_freq=120 icon= script="$PLUGIN_DIR/wifi.sh"
+
+sketchybar --add item cpu_temp right \
+  --set cpu_temp icon= script="sketchybar --set cpu_temp label=\$CPU_TEMP" icon.padding_left="$COMP_PADDING" \
+  --subscribe cpu_temp system_stats
+
+# === MEDIA (left of the physical notch on the built-in display) ===
+# `q` is SketchyBar's notch-aware left lane. Unlike an invisible spacer added
+# beside the right status items, it is anchored to the notch itself and stays
+# put while dynamic status labels (clock, Wi-Fi, battery, etc.) change width.
+# Added in this order, items grow left to yield title, previous, play/pause,
+# next, notch from left to right.
+# Keep the title width fixed so it never grows into the workspace section. The
+# visualizer is deliberately confined to the inverted transport buttons. This
+# keeps the title/artist readable while condensing the spectrum into one small
+# control cluster.
+# SketchyBar display IDs are one-based here (matching AeroSpace's built-in
+# monitor ID); `main` resolves to display zero on this version and is not
+# drawable. Keep this explicit so the player never appears on the external
+# display.
+MEDIA_DISPLAY=1
+MEDIA_TITLE_WIDTH=154
+# The button item owns the two points of air around its 22pt light face. Keep
+# its icon centered in the fixed-width hit target; one-sided icon padding
+# visibly shifts each transport glyph away from the face's centre.
+MEDIA_BUTTON_WIDTH=24
+
+# The `q` lane adds its first item nearest the notch and each later item to its
+# left. This creation order therefore produces the desired visual order.
+for media_control in next toggle previous; do
+  case "$media_control" in
+    previous) media_icon="" ;;
+    toggle) media_icon="" ;;
+    next) media_icon="" ;;
+  esac
+
+  sketchybar --add item "media_$media_control" q \
+    --set "media_$media_control" \
+      display="$MEDIA_DISPLAY" \
+      drawing=off \
+      width="$MEDIA_BUTTON_WIDTH" \
+      padding_left=0 \
+      padding_right=0 \
+      icon="$media_icon" \
+      icon.color="$CLR_COMP_BG" \
+      icon.font="VictorMono Nerd Font:Regular:11.0" \
+      icon.width=22 \
+      icon.align=center \
+      icon.padding_left=0 \
+      icon.padding_right=0 \
+      label.drawing=off \
+      background.drawing=on \
+      background.color="$CLR_FG" \
+      background.corner_radius=4 \
+      background.height=20 \
+      background.padding_left=1 \
+      background.padding_right=1 \
+      background.image.drawing=off \
+      click_script="$PLUGIN_DIR/media.sh $media_control"
+done
+
+sketchybar --add item media_title q \
+  --set media_title \
+    display="$MEDIA_DISPLAY" \
+    drawing=off \
+    width="$MEDIA_TITLE_WIDTH" \
+    padding_left=4 \
+    padding_right=4 \
+    icon.drawing=off \
+    label="" \
+    label.max_chars=22 \
+    label.align=left \
+    scroll_texts=on \
+    scroll_duration=80 \
+    background.drawing=on \
+    background.color=0x00000000 \
+    background.height=20 \
+    background.image.drawing=off \
+    update_freq=30 \
+    script="$PLUGIN_DIR/media.sh" \
+  --subscribe media_title media_change system_woke aerospace_workspace_change aerospace_workspace_icons_changed
+
+# === ITEM GROUPS ===
+LEFT_ITEMS=("${LEFT_SPACE_ITEMS[@]}" front_app)
+RIGHT_ITEMS=(aerospace_toggle restart_aerospace_sketchybar clock volume battery keyboard_layout net cpu_temp)
+MEDIA_ITEMS=(media_title media_previous media_toggle media_next)
+
+# === COMPARTMENTS (Outer padding for clean edges; height=26 leaves vertical margin in 34pt bar) ===
+sketchybar --add bracket left_compartment "${LEFT_ITEMS[@]}" \
+  --set left_compartment \
+    background.color="$CLR_COMP_BG" \
+    background.corner_radius=8 \
+    background.height=26 \
+    background.border_color="$CLR_COMP_BORDER" \
+    background.border_width=1 \
+    background.drawing=on
+
+sketchybar --add bracket right_compartment "${RIGHT_ITEMS[@]}" \
+  --set right_compartment \
+    background.color="$CLR_COMP_BG" \
+    background.corner_radius=8 \
+    background.height=26 \
+    background.border_color="$CLR_COMP_BORDER" \
+    background.border_width=1 \
+    background.padding_left=0 \
+    background.drawing=on
+
+sketchybar --add bracket media_compartment "${MEDIA_ITEMS[@]}" \
+  --set media_compartment \
+    display="$MEDIA_DISPLAY" \
+    background.color="$CLR_COMP_BG" \
+    background.corner_radius=8 \
+    background.height=26 \
+    background.border_color="$CLR_COMP_BORDER" \
+    background.border_width=1 \
+    background.drawing=off
+
+# === FINALIZE ===
+# Item scripts do not run merely because they are declared during a reload.
+# Query Now Playing directly so media items configured as hidden above are made
+# visible immediately when an active session exists. Triggering the built-in
+# media_change event here is not reliable while SketchyBar is loading config.
+SENDER=routine CONFIG_DIR="$CONFIG_DIR" "$PLUGIN_DIR/media.sh"
+sketchybar --update

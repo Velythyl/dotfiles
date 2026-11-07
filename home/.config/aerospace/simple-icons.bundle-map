@@ -1,0 +1,25 @@
+# Bundle identifier|Simple Icons slug
+#
+# This is deliberately a small, explicit map: Bundle IDs are stable, the SVGs are
+# vendored locally, and unlisted applications fall back to the local renderer.
+org.mozilla.firefox|firefox
+com.google.Chrome|googlechrome
+company.thebrowser.Browser|arc
+com.todesktop.230313mzl4w4u92|cursor
+md.obsidian|obsidian
+notion.id|notion
+com.hnc.Discord|discord
+com.figma.Desktop|figma
+com.github.GitHub|github
+com.raycast.macos|raycast
+com.spotify.client|spotify
+us.zoom.xos|zoom
+com.linear|linear
+ru.keepcoder.Telegram|telegram
+com.docker.docker|docker
+com.postmanlabs.mac|postman
+dev.warp.Warp-Stable|warp
+com.googlecode.iterm2|iterm2
+org.alacritty|alacritty
+com.github.wez.wezterm|wezterm
+com.1password.1password|1password

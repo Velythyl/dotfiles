@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Link every file in home/ into $HOME without replacing unrelated directories.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./install [--backup] [--dry-run]
+
+  --backup   Move conflicting files or links to ~/.dotfiles-backups/<timestamp>.
+  --dry-run  Show the actions without changing anything.
+
+On macOS, after linking files, the installer builds the patched Cava audio-tap
+binary when Homebrew has installed cava, automake, and libtool. Set
+SKIP_CAVA_AUDIOTAP_INSTALL=true to skip that optional bootstrap.
+EOF
+}
+
+backup=false
+dry_run=false
+while (($#)); do
+  case "$1" in
+    --backup) backup=true ;;
+    --dry-run) dry_run=true ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source_root="$repo_root/home"
+timestamp="$(date +%Y%m%d-%H%M%S)"
+backup_root="${DOTFILES_BACKUP_DIR:-$HOME/.dotfiles-backups}/$timestamp"
+
+sources=()
+conflicts=()
+while IFS= read -r source; do
+  sources+=("$source")
+  relative="${source#"$source_root/"}"
+  destination="$HOME/$relative"
+  if [[ -L "$destination" ]] && [[ "$(/usr/bin/readlink "$destination")" == "$source" ]]; then
+    continue
+  fi
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    conflicts+=("$relative")
+  fi
+done < <(/usr/bin/find "$source_root" -type f | LC_ALL=C /usr/bin/sort)
+
+if ((${#conflicts[@]})) && [[ "$backup" == false && "$dry_run" == false ]]; then
+  printf 'Refusing to replace existing paths:\n' >&2
+  printf '  %s\n' "${conflicts[@]}" >&2
+  printf 'Re-run with --backup to move them to %s.\n' "$backup_root" >&2
+  exit 1
+fi
+
+for source in "${sources[@]}"; do
+  relative="${source#"$source_root/"}"
+  destination="$HOME/$relative"
+  if [[ -L "$destination" ]] && [[ "$(/usr/bin/readlink "$destination")" == "$source" ]]; then
+    printf 'unchanged  %s\n' "$relative"
+    continue
+  fi
+
+  if [[ -e "$destination" || -L "$destination" ]]; then
+    if [[ "$dry_run" == true ]]; then
+      printf 'backup    %s -> %s\n' "$relative" "$backup_root/$relative"
+    else
+      mkdir -p "$(dirname "$backup_root/$relative")"
+      mv "$destination" "$backup_root/$relative"
+    fi
+  fi
+
+  if [[ "$dry_run" == true ]]; then
+    printf 'link      %s -> %s\n' "$relative" "$source"
+  else
+    mkdir -p "$(dirname "$destination")"
+    ln -s "$source" "$destination"
+    printf 'linked    %s\n' "$relative"
+  fi
+done
+
+# Cava 1.0.0's Homebrew binary can reject a valid Core Audio Capture grant
+# before attempting the tap. Bootstrap the patched local copy on first setup.
+# Do not make dry runs or non-macOS installs perform a build.
+if [[ "$(uname -s)" == "Darwin" && "$dry_run" == false && "${SKIP_CAVA_AUDIOTAP_INSTALL:-false}" != true ]]; then
+  cava_audiotap_bin="$HOME/.local/opt/cava-audiotap/bin/cava"
+  cava_audiotap_install="$HOME/.local/bin/cava-audiotap-install"
+  if [[ -x "$cava_audiotap_bin" ]]; then
+    printf 'unchanged  .local/opt/cava-audiotap/bin/cava\n'
+  elif command -v brew >/dev/null 2>&1 && brew list --versions cava automake libtool >/dev/null 2>&1; then
+    "$cava_audiotap_install"
+  else
+    printf 'skipped    Cava audio-tap bootstrap (run brew bundle, then ./install)\n' >&2
+  fi
+fi

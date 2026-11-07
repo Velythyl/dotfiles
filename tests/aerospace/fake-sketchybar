@@ -1,0 +1,11 @@
+#!/bin/bash
+
+set -euo pipefail
+
+if [[ -n "${FAKE_SKETCHYBAR_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$FAKE_SKETCHYBAR_LOG"
+fi
+
+if [[ "${1:-}" == "--query" && "${2:-}" == "displays" ]]; then
+    printf '%b\n' "${FAKE_SKETCHYBAR_DISPLAYS:-}"
+fi

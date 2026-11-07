@@ -1,0 +1,10 @@
+tap "nikitabobko/tap", trusted: { casks: ["aerospace"] }
+cask "nikitabobko/tap/aerospace"
+brew "sketchybar"
+cask "kitty"
+brew "cava"
+brew "automake"
+brew "libtool"
+brew "nowplaying-cli"
+brew "python"
+cask "font-victor-mono-nerd-font"

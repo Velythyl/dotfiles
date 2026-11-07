@@ -1,0 +1,529 @@
+#!/bin/bash
+# Reassign workspaces after a display topology change.
+#
+# Layouts:
+#   laptop:       1-9 built-in
+#   laptop + 1:   1-4 built-in, 5-9 external
+#   laptop + 2:   1-3 built-in, 4-6 left external, 7-9 right external
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: $(basename "$0") [--delay SECONDS] [--from-display-change] [--dry-run]" >&2
+}
+
+delay_seconds=0
+dry_run=false
+from_display_change=false
+
+while (($#)); do
+    case "$1" in
+        --delay)
+            [[ $# -ge 2 ]] || { usage; exit 2; }
+            delay_seconds="$2"
+            shift 2
+            ;;
+        --dry-run)
+            dry_run=true
+            shift
+            ;;
+        --from-display-change)
+            from_display_change=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            usage
+            exit 2
+            ;;
+    esac
+done
+
+if [[ -n "${AEROSPACE_BIN:-}" ]]; then
+    aerospace_bin="$AEROSPACE_BIN"
+else
+    aerospace_bin="$(command -v aerospace || true)"
+fi
+
+if [[ -z "$aerospace_bin" || ! -x "$aerospace_bin" ]]; then
+    echo "aerospace-workspace-layout: AeroSpace CLI not found" >&2
+    exit 1
+fi
+
+log() {
+    local message="aerospace-workspace-layout: $*"
+    printf '%s\n' "$message" >&2
+    /usr/bin/logger -t aerospace-workspace-layout -- "$message" 2>/dev/null || true
+}
+
+sync_sketchybar_to_only_display() {
+    local sketchybar_bin display_ids display_id workspace
+    local -a sketchybar_args=()
+
+    sketchybar_bin="${SKETCHYBAR_BIN:-}"
+    if [[ -z "$sketchybar_bin" ]]; then
+        sketchybar_bin="$(command -v sketchybar || true)"
+    fi
+    if [[ -z "$sketchybar_bin" && -x /opt/homebrew/bin/sketchybar ]]; then
+        sketchybar_bin=/opt/homebrew/bin/sketchybar
+    fi
+    [[ -n "$sketchybar_bin" ]] || return 1
+
+    display_ids="$("$sketchybar_bin" --query displays 2>/dev/null | /usr/bin/awk -F ':' '
+        /"arrangement-id"/ {
+            id = $2
+            gsub(/[^0-9]/, "", id)
+            if (id != "") print id
+        }
+    ')"
+    [[ "$(printf '%s\n' "$display_ids" | /usr/bin/awk 'NF { count++ } END { print count + 0 }')" == 1 ]] || return 1
+    display_id="$(printf '%s\n' "$display_ids" | /usr/bin/awk 'NF { print; exit }')"
+
+    for workspace in {1..9}; do
+        sketchybar_args+=(--set "space.$workspace" "display=$display_id")
+    done
+    "$sketchybar_bin" "${sketchybar_args[@]}" >/dev/null 2>&1
+}
+
+# SketchyBar can emit more than one display_change while macOS is settling. A
+# queued invocation would run after the user has resumed working and can steal
+# focus by moving workspaces, so let the in-flight update handle the topology.
+lock_dir="${TMPDIR:-/tmp}/aerospace-workspace-layout.lock"
+
+# Coalesce the burst of display_change events that macOS emits while a dock is
+# being enumerated. Each invocation records its arrival before trying the
+# lock, so the lock holder can wait for a short quiet period after the *last*
+# event instead of paying a fixed delay from the first one.
+layout_state_dir="${AEROSPACE_LAYOUT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/aerospace-workspace-layout}"
+pending_events_dir="$layout_state_dir/pending-display-events"
+if [[ "$from_display_change" == true ]]; then
+    mkdir -p "$pending_events_dir"
+    mktemp "$pending_events_dir/event.XXXXXXXX" >/dev/null
+fi
+
+if ! mkdir "$lock_dir" 2>/dev/null; then
+    log "layout update already running; skipped duplicate display event"
+    exit 0
+fi
+trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+
+# Moving a workspace focuses it. Remember the focus before the display-settle
+# delay; if the user changes workspace while waiting, this remap is stale and
+# must not override their newer choice. AeroSpace can intentionally be disabled
+# from SketchyBar while display events continue to arrive, so keep enough state
+# to repair a single-display bar without its IPC server.
+aerospace_available=true
+if ! focused_workspace="$($aerospace_bin list-workspaces --focused --format '%{workspace}' 2>/dev/null)"; then
+    aerospace_available=false
+    focused_workspace=""
+fi
+
+wait_for_display_settle() {
+    [[ "$from_display_change" == true ]] || return 0
+
+    local stable_checks_required="${AEROSPACE_LAYOUT_STABLE_CHECKS:-8}"
+    local max_checks="${AEROSPACE_LAYOUT_MAX_CHECKS:-80}"
+    local checks=0 stable_checks=0 previous_inventory="" current_inventory=""
+    local sketchybar_bin
+
+    [[ "$stable_checks_required" =~ ^[1-9][0-9]*$ ]] || stable_checks_required=8
+    [[ "$max_checks" =~ ^[1-9][0-9]*$ ]] || max_checks=80
+    sketchybar_bin="${SKETCHYBAR_BIN:-}"
+    if [[ -z "$sketchybar_bin" ]]; then
+        sketchybar_bin="$(command -v sketchybar || true)"
+    fi
+    if [[ -z "$sketchybar_bin" && -x /opt/homebrew/bin/sketchybar ]]; then
+        sketchybar_bin=/opt/homebrew/bin/sketchybar
+    fi
+
+    while true; do
+        # Mark every event seen so far as handled, then wait for the next
+        # quiet interval. A marker that appears while sleeping starts over.
+        /usr/bin/find "$pending_events_dir" -type f -delete 2>/dev/null || true
+        if [[ "$delay_seconds" != "0" ]]; then
+            sleep "$delay_seconds"
+        fi
+        checks=$((checks + 1))
+        if ((checks >= max_checks)); then
+            log "timed out waiting for stable display inventories; reconciling the latest state"
+            return 0
+        fi
+        if /usr/bin/find "$pending_events_dir" -type f -print -quit 2>/dev/null | /usr/bin/grep -q .; then
+            stable_checks=0
+            previous_inventory=""
+            continue
+        fi
+
+        # A fast laptop+2 -> laptop disconnect briefly looks like laptop+1.
+        # macOS can stop emitting display_change before both clients expose the
+        # final inventory, so an event-only debounce accepts that intermediate
+        # state. Require repeated agreement from the read-only inventories for
+        # roughly two seconds (8 * the default 0.25s interval).
+        current_inventory="$(
+            "$aerospace_bin" list-monitors --format 'aerospace|%{monitor-id}|%{monitor-name}|%{monitor-appkit-nsscreen-screens-id}' 2>/dev/null || true
+            if [[ -n "$sketchybar_bin" ]]; then
+                "$sketchybar_bin" --query displays 2>/dev/null | /usr/bin/awk -F ':' '
+                    /"arrangement-id"/ {
+                        arrangement = $2
+                        gsub(/[^0-9]/, "", arrangement)
+                    }
+                    /"DirectDisplayID"/ {
+                        direct_id = $2
+                        gsub(/[^0-9]/, "", direct_id)
+                        if (arrangement != "" && direct_id != "") print "sketchybar|" arrangement "|" direct_id
+                    }
+                '
+            fi
+        )"
+
+        if [[ -n "$current_inventory" && "$current_inventory" == "$previous_inventory" ]]; then
+            stable_checks=$((stable_checks + 1))
+        else
+            stable_checks=1
+            previous_inventory="$current_inventory"
+        fi
+        if ((stable_checks >= stable_checks_required)); then
+            return 0
+        fi
+    done
+}
+
+wait_for_display_settle
+
+if [[ "$aerospace_available" == false ]]; then
+    if sync_sketchybar_to_only_display; then
+        log "AeroSpace is disabled; assigned all workspace icons to the only display"
+    else
+        log "AeroSpace is unavailable; could not safely reconcile a multi-display layout"
+    fi
+    exit 0
+fi
+
+# Refresh the global shortcuts after macOS has finished enumerating the new
+# display set. `relaunch_bar_and_aero.sh` recovers from the observed transition
+# failure by reloading this config manually, so do that once here after the
+# display-change burst has been coalesced. Return to the main mode as well so a
+# transition cannot leave only the unmodified resize-mode bindings active.
+#
+# A third-party app holding macOS Secure Input can independently block global
+# hotkeys; reloading cannot override that OS protection. The helper log here
+# still distinguishes the display refresh from that separate failure mode.
+if [[ "$from_display_change" == true ]]; then
+    "$aerospace_bin" reload-config
+    "$aerospace_bin" mode main
+    log "reloaded config and restored main mode after display change"
+fi
+
+monitor_rows="$("$aerospace_bin" list-monitors --format '%{monitor-id}|%{monitor-name}|%{monitor-appkit-nsscreen-screens-id}')"
+if [[ -z "$monitor_rows" ]]; then
+    log "no monitors reported; leaving workspaces untouched"
+    exit 0
+fi
+
+# A display_change can be emitted repeatedly without a topology change. Running
+# the remap again would focus every moved workspace, so process each topology
+# only once when invoked by SketchyBar.
+topology_state_file="$layout_state_dir/last-topology"
+# AppKit's screen identifier can change independently of the physical topology
+# (and is synthetic for some AirPlay displays), so it must not make us remap
+# workspaces that are already on the intended monitors.
+topology_fingerprint="$(printf '%s\n' "$monitor_rows" | /usr/bin/awk -F '|' '{ print $1 "|" $2 }' | /usr/bin/sort)"
+topology_unchanged=false
+if [[ "$from_display_change" == true && -f "$topology_state_file" ]]; then
+    previous_topology="$(<"$topology_state_file")"
+    if [[ "$previous_topology" == "$topology_fingerprint" ]]; then
+        topology_unchanged=true
+    fi
+fi
+built_in_monitor=""
+external_monitors=()
+monitor_count=0
+
+while IFS='|' read -r monitor_id monitor_name monitor_appkit_id; do
+    [[ -n "$monitor_id" && -n "$monitor_name" ]] || continue
+    monitor_count=$((monitor_count + 1))
+
+    if printf '%s\n' "$monitor_name" | /usr/bin/grep -qi 'built-in'; then
+        if [[ -n "$built_in_monitor" ]]; then
+            log "multiple built-in displays reported; leaving workspaces untouched"
+            exit 0
+        fi
+        built_in_monitor="$monitor_id"
+    else
+        external_monitors+=("$monitor_id")
+    fi
+done <<< "$monitor_rows"
+
+if [[ -z "$built_in_monitor" ]]; then
+    log "built-in display not found; leaving workspaces untouched"
+    exit 0
+fi
+
+workspace_targets=()
+case "$monitor_count" in
+    1)
+        [[ ${#external_monitors[@]} -eq 0 ]] || {
+            log "unexpected one-display topology; leaving workspaces untouched"
+            exit 0
+        }
+        for workspace in 1 2 3 4 5 6 7 8 9; do
+            workspace_targets+=("$workspace|$built_in_monitor")
+        done
+        ;;
+    2)
+        [[ ${#external_monitors[@]} -eq 1 ]] || {
+            log "unexpected two-display topology; leaving workspaces untouched"
+            exit 0
+        }
+        for workspace in 1 2 3 4; do
+            workspace_targets+=("$workspace|$built_in_monitor")
+        done
+        for workspace in 5 6 7 8 9; do
+            workspace_targets+=("$workspace|${external_monitors[0]}")
+        done
+        ;;
+    3)
+        [[ ${#external_monitors[@]} -eq 2 ]] || {
+            log "unexpected three-display topology; leaving workspaces untouched"
+            exit 0
+        }
+        for workspace in 1 2 3; do
+            workspace_targets+=("$workspace|$built_in_monitor")
+        done
+        for workspace in 4 5 6; do
+            workspace_targets+=("$workspace|${external_monitors[0]}")
+        done
+        for workspace in 7 8 9; do
+            workspace_targets+=("$workspace|${external_monitors[1]}")
+        done
+        ;;
+    *)
+        log "unsupported $monitor_count-display topology; leaving workspaces untouched"
+        exit 0
+        ;;
+esac
+
+# Do not apply a delayed layout update after the user has switched workspaces.
+# Still refresh SketchyBar's display associations below: AeroSpace itself may
+# change focus while removing a monitor, and exiting before that refresh leaves
+# workspace items assigned to the disconnected display.
+current_focused_workspace="$("$aerospace_bin" list-workspaces --focused --format '%{workspace}')"
+focus_changed_while_settling=false
+if [[ -n "$focused_workspace" && "$current_focused_workspace" != "$focused_workspace" ]]; then
+    focus_changed_while_settling=true
+fi
+
+workspace_rows="$("$aerospace_bin" list-workspaces --all --format '%{workspace}|%{monitor-id}')"
+
+current_monitor_for_workspace() {
+    local wanted_workspace="$1"
+    printf '%s\n' "$workspace_rows" | /usr/bin/awk -F '|' -v workspace="$wanted_workspace" \
+        '$1 == workspace { print $2; exit }'
+}
+
+sync_sketchybar_workspace_displays() {
+    local sketchybar_bin monitor_display_rows workspace_display_rows workspace monitor_id display_id
+    local -a sketchybar_args=()
+
+    # display_change is delivered by SketchyBar's launchd process, whose PATH
+    # is not guaranteed to include Homebrew.  If this lookup fails, AeroSpace
+    # moves the workspaces but the existing space.* items remain on their old
+    # displays, making an icon on one monitor switch a workspace on another.
+    # Prefer an explicit override for tests/alternate installs, then resolve
+    # the normal command, with the standard Apple Silicon Homebrew location as
+    # a final fallback.
+    sketchybar_bin="${SKETCHYBAR_BIN:-}"
+    if [[ -z "$sketchybar_bin" ]]; then
+        sketchybar_bin="$(command -v sketchybar || true)"
+    fi
+    if [[ -z "$sketchybar_bin" && -x /opt/homebrew/bin/sketchybar ]]; then
+        sketchybar_bin=/opt/homebrew/bin/sketchybar
+    fi
+    if [[ -z "$sketchybar_bin" ]]; then
+        log "SketchyBar CLI not found; skipped workspace icon display sync"
+        return 0
+    fi
+
+    # For physical monitors AeroSpace's AppKit screen ID is normally the
+    # CoreGraphics direct-display ID. AirPlay is different: AeroSpace can
+    # expose a small synthetic screen ID (2, 3, ...) while SketchyBar exposes a
+    # CoreGraphics ID such as 14. Match all unambiguous physical IDs first,
+    # then pair unresolved monitors with the remaining SketchyBar displays.
+    # The second pass prefers an equal arrangement ID, which is how AppKit's
+    # synthetic AirPlay IDs are currently ordered; the final ordered fallback
+    # also handles two simultaneous AirPlay displays.
+    local sketchybar_display_rows
+    sketchybar_display_rows="$("$sketchybar_bin" --query displays 2>/dev/null | /usr/bin/awk -F ':' '
+        /"arrangement-id"/ {
+            arrangement = $2
+            gsub(/[^0-9]/, "", arrangement)
+        }
+        /"DirectDisplayID"/ {
+            direct_id = $2
+            gsub(/[^0-9]/, "", direct_id)
+            if (direct_id != "" && arrangement != "") print direct_id "|" arrangement
+        }
+    ')"
+    if [[ -z "$sketchybar_display_rows" ]]; then
+        log "SketchyBar did not report display IDs; skipped workspace icon display sync"
+        return 0
+    fi
+
+    monitor_display_rows="$(
+        {
+            printf '%s\n' "$monitor_rows" | /usr/bin/awk -F '|' '{ print "M|" $1 "|" $3 "|" $2 }'
+            printf '%s\n' "$sketchybar_display_rows" | /usr/bin/awk -F '|' '{ print "S|" $1 "|" $2 }'
+        } | /usr/bin/awk -F '|' '
+            $1 == "M" {
+                monitor_count++
+                monitor_id[monitor_count] = $2
+                appkit_id[monitor_count] = $3
+                monitor_name[monitor_count] = tolower($4)
+            }
+            $1 == "S" {
+                sketchybar_count++
+                direct_id[sketchybar_count] = $2
+                arrangement_id[sketchybar_count] = $3
+            }
+            END {
+                # Never direct-match AirPlay synthetic IDs: one can collide
+                # with the real CoreGraphics ID of a physical display.
+                for (i = 1; i <= monitor_count; i++) {
+                    if (monitor_name[i] ~ /airplay/) continue
+                    for (j = 1; j <= sketchybar_count; j++) {
+                        if (!used[j] && appkit_id[i] == direct_id[j]) {
+                            mapped[i] = arrangement_id[j]
+                            used[j] = 1
+                            break
+                        }
+                    }
+                }
+                for (i = 1; i <= monitor_count; i++) {
+                    if (mapped[i] != "") continue
+                    for (j = 1; j <= sketchybar_count; j++) {
+                        if (!used[j] && appkit_id[i] == arrangement_id[j]) {
+                            mapped[i] = arrangement_id[j]
+                            used[j] = 1
+                            break
+                        }
+                    }
+                }
+                for (i = 1; i <= monitor_count; i++) {
+                    if (mapped[i] != "") continue
+                    for (j = 1; j <= sketchybar_count; j++) {
+                        if (!used[j]) {
+                            mapped[i] = arrangement_id[j]
+                            used[j] = 1
+                            break
+                        }
+                    }
+                }
+                for (i = 1; i <= monitor_count; i++) {
+                    if (mapped[i] != "") print monitor_id[i] "|" mapped[i]
+                }
+            }
+        '
+    )"
+
+    workspace_display_rows="$("$aerospace_bin" list-workspaces --all --format '%{workspace}|%{monitor-id}')"
+
+    while IFS='|' read -r workspace monitor_id; do
+        [[ "$workspace" =~ ^[1-9]$ && "$monitor_id" =~ ^[1-9][0-9]*$ ]] || continue
+        display_id="$(printf '%s\n' "$monitor_display_rows" | /usr/bin/awk -F '|' -v wanted="$monitor_id" '$1 == wanted { print $2; exit }')"
+        if [[ ! "$display_id" =~ ^[1-9][0-9]*$ ]]; then
+            log "no SketchyBar arrangement ID for workspace $workspace monitor $monitor_id"
+            continue
+        fi
+        sketchybar_args+=(--set "space.$workspace" "display=$display_id")
+    done <<< "$workspace_display_rows"
+
+    ((${#sketchybar_args[@]})) || return 0
+    "$sketchybar_bin" "${sketchybar_args[@]}" >/dev/null 2>&1 || \
+        log "could not assign SketchyBar workspace displays"
+}
+
+if [[ "$focus_changed_while_settling" == true ]]; then
+    sync_sketchybar_workspace_displays
+    "${AEROSPACE_ICON_SYNC_HELPER:-$HOME/.local/bin/aerospace-sync-workspace-icons}" --refresh >/dev/null 2>&1 || \
+        log "could not refresh SketchyBar workspace icons"
+    log "focus changed while displays settled; skipped workspace remap but refreshed SketchyBar"
+    exit 0
+fi
+
+# macOS can re-enumerate AppKit display IDs without changing AeroSpace's
+# monitor IDs or names. Even when the physical topology is unchanged, update
+# SketchyBar's explicit per-item display assignments so no workspace markers
+# remain attached to the old display index. Only skip the remap when the
+# workspace layout itself still matches the configured topology: a previous
+# partial display transition can otherwise leave workspaces stranded while
+# this unchanged-topology shortcut preserves the invalid layout indefinitely.
+workspace_layout_matches_targets=true
+for target in "${workspace_targets[@]}"; do
+    IFS='|' read -r workspace target_monitor <<< "$target"
+    current_monitor="$(current_monitor_for_workspace "$workspace")"
+    if [[ -z "$current_monitor" || "$current_monitor" != "$target_monitor" ]]; then
+        workspace_layout_matches_targets=false
+        break
+    fi
+done
+
+if [[ "$topology_unchanged" == true && "$workspace_layout_matches_targets" == true ]]; then
+    sync_sketchybar_workspace_displays
+    "${AEROSPACE_ICON_SYNC_HELPER:-$HOME/.local/bin/aerospace-sync-workspace-icons}" --refresh >/dev/null 2>&1 || \
+        log "could not refresh SketchyBar workspace icons"
+    log "display topology and workspace layout are unchanged; refreshed SketchyBar display assignments"
+    exit 0
+fi
+
+last_moved_workspace=""
+move_commands=()
+for target in "${workspace_targets[@]}"; do
+    IFS='|' read -r workspace target_monitor <<< "$target"
+    current_monitor="$(current_monitor_for_workspace "$workspace")"
+
+    if [[ -z "$current_monitor" ]]; then
+        log "workspace $workspace is unavailable; leaving it untouched"
+        continue
+    fi
+    if [[ "$current_monitor" == "$target_monitor" ]]; then
+        continue
+    fi
+
+    if [[ "$dry_run" == true ]]; then
+        printf 'DRY-RUN workspace=%s target-monitor=%s\n' "$workspace" "$target_monitor"
+    else
+        # One eval uses a single CLI connection and avoids focus restoration
+        # between every move. `move-workspace-to-monitor` still focuses the
+        # moved workspace, so restore the user's original focus once below.
+        move_commands+=("move-workspace-to-monitor --workspace $workspace $target_monitor")
+        last_moved_workspace="$workspace"
+    fi
+done
+
+if [[ "$dry_run" == false && ${#move_commands[@]} -gt 0 ]]; then
+    move_expression="$(IFS=';'; printf '%s' "${move_commands[*]}")"
+    "$aerospace_bin" eval "$move_expression"
+fi
+
+if [[ "$dry_run" == false && -n "$focused_workspace" ]]; then
+    final_focused_workspace="$("$aerospace_bin" list-workspaces --focused --format '%{workspace}')"
+    if [[ "$final_focused_workspace" == "$last_moved_workspace" && "$final_focused_workspace" != "$focused_workspace" ]]; then
+        "$aerospace_bin" workspace "$focused_workspace"
+    elif [[ "$final_focused_workspace" != "$focused_workspace" ]]; then
+        log "focus changed during workspace remap; left it untouched"
+    fi
+fi
+
+if [[ "$dry_run" == false ]]; then
+    sync_sketchybar_workspace_displays
+    "${AEROSPACE_ICON_SYNC_HELPER:-$HOME/.local/bin/aerospace-sync-workspace-icons}" --refresh >/dev/null 2>&1 || \
+        log "could not refresh SketchyBar workspace icons"
+
+    # Only mark the topology handled after every workspace move and display
+    # association completed. With `set -e`, a failed remap remains retryable.
+    mkdir -p "$layout_state_dir"
+    printf '%s\n' "$topology_fingerprint" > "$topology_state_file"
+fi

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Build a Cava binary that lets Core Audio, rather than Cava's unreliable
+# private-TCC preflight, decide whether Audio Capture is allowed.
+set -euo pipefail
+
+version=1.0.0
+prefix="${CAVA_AUDIOTAP_PREFIX:-$HOME/.local/opt/cava-audiotap}"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+patch_file="$script_dir/../share/cava-audiotap/cava-coreaudio-tap.patch"
+work_dir="$(mktemp -d "${TMPDIR:-/tmp}/cava-audiotap.XXXXXX")"
+trap 'rm -rf "$work_dir"' EXIT
+
+command -v brew >/dev/null || { echo 'Homebrew is required.' >&2; exit 1; }
+command -v curl >/dev/null || { echo 'curl is required.' >&2; exit 1; }
+[[ -f "$patch_file" ]] || { echo "Missing patch: $patch_file" >&2; exit 1; }
+
+curl -fsSL "https://github.com/karlstav/cava/archive/refs/tags/${version}.tar.gz" |
+  tar -xz -C "$work_dir" --strip-components=1
+patch -d "$work_dir" -p1 < "$patch_file"
+
+tool_dir="$work_dir/tools"
+mkdir -p "$tool_dir"
+ln -s "$(brew --prefix libtool)/bin/glibtool" "$tool_dir/libtool"
+ln -s "$(brew --prefix libtool)/bin/glibtoolize" "$tool_dir/libtoolize"
+
+cd "$work_dir"
+PATH="$tool_dir:$(brew --prefix automake)/libexec/gnubin:$PATH" ./autogen.sh
+CPPFLAGS="-I$(brew --prefix)/include" \
+LDFLAGS="-L$(brew --prefix)/lib" \
+  ./configure --prefix="$prefix"
+make -j "$(sysctl -n hw.ncpu)"
+make install
+
+printf 'Installed patched Cava at %s/bin/cava\n' "$prefix"

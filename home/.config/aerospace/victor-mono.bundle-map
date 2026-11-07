@@ -1,0 +1,6 @@
+# Bundle identifier|Victor Mono Nerd Font glyph
+#
+# Keep this intentionally curated. It is used only when a text glyph reads more
+# cleanly than a logo at SketchyBar's small workspace-marker size.
+com.apple.Terminal|
+com.googlecode.iterm2|

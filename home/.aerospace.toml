@@ -1,0 +1,173 @@
+# Reference: https://github.com/i3/i3/blob/next/etc/config
+
+config-version = 2
+
+# SketchyBar always exposes the complete numbered workspace set, including
+# empty workspaces. Keep them addressable under config-version 2.
+persistent-workspaces = ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+
+# i3 doesn't have "normalizations" feature that why we disable them here.
+# But the feature is very helpful.
+# Normalizations eliminate all sorts of weird tree configurations that don't make sense.
+# Give normalizations a chance and enable them back.
+enable-normalization-flatten-containers = false
+enable-normalization-opposite-orientation-for-nested-containers = false
+
+start-at-login = true
+
+# Apply the workspace layout appropriate for the displays currently connected.
+# Start SketchyBar alongside AeroSpace.
+after-startup-command = [
+    'exec-and-forget ~/.local/bin/aerospace-apply-workspace-layout',
+    'exec-and-forget /opt/homebrew/bin/sketchybar',
+]
+
+# Tell SketchyBar which AeroSpace workspaces are visible so every monitor keeps
+# its own active indicator. FOCUSED_WORKSPACE remains available to front_app.
+exec-on-workspace-change = ['/bin/bash', '-c',
+    '~/.local/bin/aerospace-guard-workspaces "$AEROSPACE_PREV_WORKSPACE" "$AEROSPACE_FOCUSED_WORKSPACE"; FOCUSED_WORKSPACE="$(/opt/homebrew/bin/aerospace list-workspaces --focused --format "%{workspace}" 2>/dev/null || true)"; VISIBLE_WORKSPACES="$(/opt/homebrew/bin/aerospace list-workspaces --monitor all --visible --format "%{workspace}" 2>/dev/null | /usr/bin/paste -sd, -)"; /opt/homebrew/bin/sketchybar --trigger aerospace_workspace_change FOCUSED_WORKSPACE="$FOCUSED_WORKSPACE" VISIBLE_WORKSPACES="$VISIBLE_WORKSPACES" FOCUSED_APP="$(/opt/homebrew/bin/aerospace list-windows --focused --format "%{app-name}" 2>/dev/null || true)"; ~/.local/bin/aerospace-sync-workspace-icons --workspace-change "$AEROSPACE_PREV_WORKSPACE" "$FOCUSED_WORKSPACE" >/dev/null 2>&1 &'
+]
+
+# Moving the cursor on monitor-focus changes can feed back into macOS focus
+# tracking and bounce focus between displays. Keep the cursor where the user
+# put it when switching workspaces from SketchyBar.
+on-focused-monitor-changed = []
+
+# Update the focused workspace marker without changing the active workspace.
+on-focus-changed = ['exec-and-forget ~/.local/bin/aerospace-sync-workspace-icons --from-focus']
+
+[mode.main.binding]
+    # Global macOS shortcut: launch Kitty or bring it to the front. AeroSpace
+    # runs at login, so this also applies outside of other terminal apps.
+    cmd-t = 'exec-and-forget open -a Kitty'
+
+    # See: https://nikitabobko.github.io/AeroSpace/goodies#open-a-new-window-with-applescript
+    #alt-enter = '''exec-and-forget osascript -e '
+    #tell application "Terminal"
+    #    do script
+    #    activate
+    #end tell'
+    #'''
+
+    # i3 wraps focus by default
+    alt-j =         'focus --boundaries-action wrap-around-the-workspace left'
+    alt-k =         'focus --boundaries-action wrap-around-the-workspace down'
+    alt-l =         'focus --boundaries-action wrap-around-the-workspace up'
+    alt-semicolon = 'focus --boundaries-action wrap-around-the-workspace right'
+
+    alt-shift-j = 'move left'
+    alt-shift-k = 'move down'
+    alt-shift-l = 'move up'
+    alt-shift-semicolon = 'move right'
+
+    # Consider using 'join-with' command as a 'split' replacement if you want to enable
+    # normalizations
+    alt-h = 'split horizontal'
+    alt-v = 'split vertical'
+
+    alt-f = 'fullscreen'
+
+    alt-s = 'layout v_accordion' # 'layout stacking' in i3
+    alt-w = 'layout h_accordion' # 'layout tabbed' in i3
+    alt-e = 'layout tiles horizontal vertical' # 'layout toggle split' in i3
+
+    alt-shift-space = 'layout floating tiling' # 'floating toggle' in i3
+
+    # Not supported, because this command is redundant in AeroSpace mental model.
+    # See: https://nikitabobko.github.io/AeroSpace/guide#floating-windows
+    #alt-space = 'focus toggle_tiling_floating'
+
+    # `focus parent`/`focus child` are not yet supported, and it's not clear whether they
+    # should be supported at all https://github.com/nikitabobko/AeroSpace/issues/5
+    # alt-a = 'focus parent'
+
+    alt-1 = 'workspace 1'
+    alt-2 = 'workspace 2'
+    alt-3 = 'workspace 3'
+    alt-4 = 'workspace 4'
+    alt-5 = 'workspace 5'
+    alt-6 = 'workspace 6'
+    alt-7 = 'workspace 7'
+    alt-8 = 'workspace 8'
+    alt-9 = 'workspace 9'
+
+    alt-shift-1 = 'move-node-to-workspace 1'
+    alt-shift-2 = 'move-node-to-workspace 2'
+    alt-shift-3 = 'move-node-to-workspace 3'
+    alt-shift-4 = 'move-node-to-workspace 4'
+    alt-shift-5 = 'move-node-to-workspace 5'
+    alt-shift-6 = 'move-node-to-workspace 6'
+    alt-shift-7 = 'move-node-to-workspace 7'
+    alt-shift-8 = 'move-node-to-workspace 8'
+    alt-shift-9 = 'move-node-to-workspace 9'
+
+    alt-shift-c = 'reload-config'
+
+    # Reapply workspace placement after connecting or disconnecting displays.
+    alt-shift-p = 'exec-and-forget ~/.local/bin/aerospace-apply-workspace-layout'
+
+    alt-r = 'mode resize'
+
+    # Secure Input can prevent macOS from delivering plain Option hotkeys and
+    # can remain stuck after the owning app exits. Keep a MEH
+    # (Control+Option+Command) fallback for the full main-mode key map. Shift
+    # remains free to distinguish move commands, unlike a Hyper fallback.
+    ctrl-alt-cmd-j =         'focus --boundaries-action wrap-around-the-workspace left'
+    ctrl-alt-cmd-k =         'focus --boundaries-action wrap-around-the-workspace down'
+    ctrl-alt-cmd-l =         'focus --boundaries-action wrap-around-the-workspace up'
+    ctrl-alt-cmd-semicolon = 'focus --boundaries-action wrap-around-the-workspace right'
+
+    ctrl-alt-cmd-shift-j = 'move left'
+    ctrl-alt-cmd-shift-k = 'move down'
+    ctrl-alt-cmd-shift-l = 'move up'
+    ctrl-alt-cmd-shift-semicolon = 'move right'
+
+    ctrl-alt-cmd-h = 'split horizontal'
+    ctrl-alt-cmd-v = 'split vertical'
+    ctrl-alt-cmd-f = 'fullscreen'
+    ctrl-alt-cmd-s = 'layout v_accordion'
+    ctrl-alt-cmd-w = 'layout h_accordion'
+    ctrl-alt-cmd-e = 'layout tiles horizontal vertical'
+    ctrl-alt-cmd-shift-space = 'layout floating tiling'
+
+    ctrl-alt-cmd-1 = 'workspace 1'
+    ctrl-alt-cmd-2 = 'workspace 2'
+    ctrl-alt-cmd-3 = 'workspace 3'
+    ctrl-alt-cmd-4 = 'workspace 4'
+    ctrl-alt-cmd-5 = 'workspace 5'
+    ctrl-alt-cmd-6 = 'workspace 6'
+    ctrl-alt-cmd-7 = 'workspace 7'
+    ctrl-alt-cmd-8 = 'workspace 8'
+    ctrl-alt-cmd-9 = 'workspace 9'
+
+    ctrl-alt-cmd-shift-1 = 'move-node-to-workspace 1'
+    ctrl-alt-cmd-shift-2 = 'move-node-to-workspace 2'
+    ctrl-alt-cmd-shift-3 = 'move-node-to-workspace 3'
+    ctrl-alt-cmd-shift-4 = 'move-node-to-workspace 4'
+    ctrl-alt-cmd-shift-5 = 'move-node-to-workspace 5'
+    ctrl-alt-cmd-shift-6 = 'move-node-to-workspace 6'
+    ctrl-alt-cmd-shift-7 = 'move-node-to-workspace 7'
+    ctrl-alt-cmd-shift-8 = 'move-node-to-workspace 8'
+    ctrl-alt-cmd-shift-9 = 'move-node-to-workspace 9'
+
+    ctrl-alt-cmd-shift-c = 'reload-config'
+    ctrl-alt-cmd-shift-p = 'exec-and-forget ~/.local/bin/aerospace-apply-workspace-layout'
+    ctrl-alt-cmd-r = 'mode resize'
+
+[mode.resize.binding]
+    h = 'resize width -50'
+    j = 'resize height +50'
+    k = 'resize height -50'
+    l = 'resize width +50'
+    enter = 'mode main'
+    esc = 'mode main'
+
+[gaps]
+    inner.horizontal = 10
+    inner.vertical =   10
+    outer.left =       10
+    outer.bottom =     10
+    # Keep the laptop's existing inset; external displays need the full
+    # SketchyBar height reserved so tiled windows do not render beneath it.
+    outer.top =        [{ monitor."built-in" = 10 }, 34]
+    outer.right =      10

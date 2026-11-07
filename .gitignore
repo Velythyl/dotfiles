@@ -1,0 +1,9 @@
+.DS_Store
+
+# Local source checkouts used only to build optional dependencies.
+/vendor/*
+!/vendor/README.md
+
+# Runtime output; configuration itself belongs in home/.
+/tmp
+/active

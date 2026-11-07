@@ -1,0 +1,58 @@
+#!/bin/bash
+# Enforce the numbered workspace set. AeroSpace creates arbitrary workspace
+# names on demand; persistent-workspaces keeps 1-9 alive but is not a whitelist.
+
+set -euo pipefail
+
+previous_workspace="${1:-}"
+current_workspace="${2:-}"
+
+case "$current_workspace" in
+    [1-9]) exit 0 ;;
+    '') exit 0 ;;
+esac
+
+if [[ -n "${AEROSPACE_BIN:-}" ]]; then
+    aerospace_bin="$AEROSPACE_BIN"
+else
+    aerospace_bin="$(command -v aerospace || true)"
+fi
+if [[ -z "$aerospace_bin" && -x /opt/homebrew/bin/aerospace ]]; then
+    aerospace_bin=/opt/homebrew/bin/aerospace
+fi
+[[ -n "$aerospace_bin" ]] || exit 1
+
+workspace_rows="$($aerospace_bin list-workspaces --all \
+    --format '%{workspace}|%{monitor-id}|%{workspace-is-visible}')"
+current_monitor="$(printf '%s\n' "$workspace_rows" | /usr/bin/awk -F '|' \
+    -v workspace="$current_workspace" '$1 == workspace { print $2; exit }')"
+[[ -n "$current_monitor" ]] || exit 1
+
+fallback_workspace=""
+case "$previous_workspace" in
+    [1-9])
+        previous_monitor="$(printf '%s\n' "$workspace_rows" | /usr/bin/awk -F '|' \
+            -v workspace="$previous_workspace" '$1 == workspace { print $2; exit }')"
+        [[ "$previous_monitor" == "$current_monitor" ]] && fallback_workspace="$previous_workspace"
+        ;;
+esac
+
+if [[ -z "$fallback_workspace" ]]; then
+    fallback_workspace="$(printf '%s\n' "$workspace_rows" | /usr/bin/awk -F '|' \
+        -v monitor="$current_monitor" '$1 ~ /^[1-9]$/ && $2 == monitor && $3 != "true" { print $1; exit }')"
+fi
+[[ "$fallback_workspace" =~ ^[1-9]$ ]] || exit 1
+
+# Preserve any window that arrived with the invalid workspace before replacing
+# that workspace on its monitor. An empty non-persistent workspace disappears
+# as soon as it is no longer visible.
+window_ids="$($aerospace_bin list-windows --workspace "$current_workspace" \
+    --format '%{window-id}' 2>/dev/null || true)"
+while IFS= read -r window_id; do
+    [[ "$window_id" =~ ^[0-9]+$ ]] || continue
+    "$aerospace_bin" move-node-to-workspace --window-id "$window_id" "$fallback_workspace"
+done <<< "$window_ids"
+
+"$aerospace_bin" workspace "$fallback_workspace"
+/usr/bin/logger -t aerospace-workspace-guard -- \
+    "replaced invalid workspace $current_workspace with $fallback_workspace on monitor $current_monitor" 2>/dev/null || true
